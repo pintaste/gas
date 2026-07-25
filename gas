@@ -4,7 +4,7 @@
 Capture and swap Grok CLI OAuth sessions stored under GROK_HOME/auth.json
 (default ~/.grok/auth.json). Command surface mirrors `ccs`:
 
-  gas add / ls / sw / to / profile / rm / check / status / stats
+  gas add / ls / sw / to / profile / rm / check / status / stats / usage
   gas exec / config-dir          # parallel isolation via GROK_HOME
   gas -n sw                      # dry-run
 
@@ -24,11 +24,18 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
+
+_USAGE_CACHE_LOCK = Lock()
 
 HOME = Path.home()
 
@@ -56,10 +63,17 @@ SWITCH_DIR = _resolve_switch_dir()
 ACCOUNTS_DIR = SWITCH_DIR / "accounts"
 SEQUENCE_PATH = SWITCH_DIR / "sequence.json"
 DIR_ACCOUNTS_PATH = SWITCH_DIR / "dir-accounts.json"
+USAGE_CACHE_PATH = SWITCH_DIR / "usage-cache.json"
 LOCK_DIR = SWITCH_DIR / ".switch.lock"
 ISOLATED_DIR = SWITCH_DIR / "isolated"
 LEGACY_PROFILES_DIR = SWITCH_DIR / "profiles"
 LEGACY_STATE_PATH = SWITCH_DIR / "state.json"
+
+# SuperGrok credit usage (same backend as grok `/usage`)
+OIDC_TOKEN_URL_DEFAULT = "https://auth.x.ai/oauth2/token"
+BILLING_BASE_DEFAULT = "https://cli-chat-proxy.grok.com/v1"
+USAGE_CACHE_TTL_DEFAULT = 120.0
+HTTP_TIMEOUT_DEFAULT = 8.0
 
 _SILENT_ENV = os.environ.get("GAS_SILENT", os.environ.get("CCS_SILENT", ""))
 SILENT = _SILENT_ENV in ("1", "true", "yes")
@@ -97,6 +111,23 @@ def now_iso() -> str:
 
 def now_ts() -> float:
     return time.time()
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
 
 
 def write_json(path: Path, data: object) -> None:
@@ -145,6 +176,8 @@ def ensure_layout() -> None:
                 "accounts": {},
             },
         )
+    # Grok refreshes tokens only in live auth.json — mirror into the matching slot.
+    sync_live_to_managed()
 
 
 def empty_sequence() -> dict:
@@ -388,6 +421,109 @@ def account_exists_email(email: str, seq: dict) -> int | None:
     return None
 
 
+def sync_live_to_managed(seq: dict | None = None) -> int | None:
+    """
+    Copy live ~/.grok/auth.json into the managed slot for the same email.
+
+    Grok silently refreshes tokens only in the live file. Without this mirror,
+    the active account's backup keeps a revoked refresh_token after rotation.
+    Returns the account number updated, or None.
+    """
+    live = load_active_auth()
+    if not live:
+        return None
+    email = auth_identity(live).get("email")
+    if not email:
+        return None
+    try:
+        seq = seq or read_sequence()
+    except SystemExit:
+        return None
+    if not seq.get("accounts"):
+        return None
+    num = account_exists_email(email, seq)
+    if num is None:
+        return None
+    path = account_auth_path(num)
+    try:
+        if path.exists():
+            old = path.read_text(encoding="utf-8")
+            new = json.dumps(live, indent=2, ensure_ascii=False) + "\n"
+            # Compare semantic token material, not formatting
+            old_entry = _auth_entry(json.loads(old)) if old.strip() else None
+            new_entry = _auth_entry(live)
+            if (
+                old_entry
+                and new_entry
+                and old_entry.get("key") == new_entry.get("key")
+                and old_entry.get("refresh_token") == new_entry.get("refresh_token")
+                and old_entry.get("expires_at") == new_entry.get("expires_at")
+            ):
+                return None
+        write_json(path, live)
+        # Keep sequence active pointer aligned with live
+        if seq.get("activeAccountNumber") != int(num):
+            seq["activeAccountNumber"] = int(num)
+            # Avoid recursive ensure_layout via write_sequence side effects — write_json only
+            write_json(SEQUENCE_PATH, {**seq, "lastUpdated": now_iso(), "version": 2})
+        return int(num)
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+
+
+def _refresh_skew_secs() -> int:
+    """Refresh this many seconds before access expiry (default 30m)."""
+    try:
+        return max(0, int(_env_float("GAS_REFRESH_SKEW_SECS", 1800)))
+    except (TypeError, ValueError):
+        return 1800
+
+
+def refresh_account_tokens(
+    num: int | str,
+    seq: dict | None = None,
+    *,
+    force: bool = False,
+) -> tuple[str, str | None]:
+    """
+    Refresh OIDC tokens for one account and write back (RT rotation-safe).
+    Returns (status, detail) — status: ok | refreshed | re-login | missing.
+    """
+    seq = seq or read_sequence()
+    if str(num) not in seq.get("accounts", {}):
+        return "missing", "not managed"
+    auth = load_auth_for_account(num, seq)
+    entry = _auth_entry(auth)
+    if not entry:
+        return "missing", "no auth backup"
+
+    has_access = bool(entry.get("key") or entry.get("access_token"))
+    needs = force or (not has_access) or _token_expired(entry, skew_s=_refresh_skew_secs())
+    if not needs:
+        return "ok", entry.get("expires_at")
+
+    if not entry.get("refresh_token"):
+        if has_access and not _token_expired(entry, skew_s=0):
+            return "ok", entry.get("expires_at")
+        return "re-login", "no refresh_token"
+
+    token_resp = refresh_oidc_tokens(entry)
+    if not token_resp:
+        if has_access and not _token_expired(entry, skew_s=0):
+            return "ok", entry.get("expires_at")
+        return "re-login", "refresh rejected"
+
+    new_auth = apply_token_refresh(auth, token_resp)
+    email = auth_identity(new_auth).get("email") or (
+        seq["accounts"].get(str(num)) or {}
+    ).get("email")
+    try:
+        persist_account_auth(num, new_auth, email)
+    except OSError as e:
+        return "re-login", str(e)
+    return "refreshed", (_auth_entry(new_auth) or {}).get("expires_at")
+
+
 # ── transactional switch ────────────────────────────────────────────────────
 
 
@@ -577,6 +713,864 @@ def materialize_account_home(num: int, dest: Path | None = None) -> Path:
     return dest
 
 
+# ── SuperGrok credit usage ──────────────────────────────────────────────────
+
+
+def _billing_base() -> str:
+    return (
+        os.environ.get("GAS_BILLING_BASE")
+        or os.environ.get("GROK_CLI_CHAT_PROXY_BASE_URL")
+        or BILLING_BASE_DEFAULT
+    ).rstrip("/")
+
+
+def _oidc_token_url(issuer: str | None = None) -> str:
+    override = os.environ.get("GAS_OIDC_TOKEN_URL")
+    if override:
+        return override
+    iss = (issuer or "https://auth.x.ai").rstrip("/")
+    return f"{iss}/oauth2/token"
+
+
+def _usage_ttl() -> float:
+    return _env_float("GAS_USAGE_TTL", USAGE_CACHE_TTL_DEFAULT)
+
+
+def _http_timeout() -> float:
+    return _env_float("GAS_USAGE_TIMEOUT", HTTP_TIMEOUT_DEFAULT)
+
+
+def usage_network_enabled() -> bool:
+    """GAS_USAGE=0 disables network fetches (used by tests / offline)."""
+    raw = os.environ.get("GAS_USAGE", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _auth_entry(auth: dict) -> dict | None:
+    if not auth:
+        return None
+    entry = next(iter(auth.values()), None)
+    return entry if isinstance(entry, dict) else None
+
+
+def _val_num(obj: Any) -> float | None:
+    """xAI often wraps numbers as {\"val\": N}."""
+    if obj is None:
+        return None
+    if isinstance(obj, (int, float)):
+        return float(obj)
+    if isinstance(obj, dict) and "val" in obj:
+        try:
+            return float(obj["val"])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _money(cents: float | int | None) -> str:
+    if cents is None:
+        return "?"
+    dollars = float(cents) / 100.0
+    if abs(dollars - round(dollars)) < 1e-9:
+        return str(int(round(dollars)))
+    return f"{dollars:.2f}"
+
+
+def _pct_color(pct: float) -> str:
+    if pct >= 90:
+        return RED
+    if pct >= 70:
+        return YELLOW
+    return GREEN
+
+
+def _parse_expires_at(expires_at: str | None) -> datetime | None:
+    if not expires_at:
+        return None
+    try:
+        s = str(expires_at).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except (ValueError, TypeError):
+        return None
+
+
+def _token_expired(entry: dict, skew_s: int = 60) -> bool:
+    exp = _parse_expires_at(entry.get("expires_at"))
+    if exp is None:
+        return False  # unknown → try as-is; refresh on 401
+    return exp.timestamp() <= now_ts() + skew_s
+
+
+def _http_json(
+    method: str,
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    data: bytes | None = None,
+    timeout: float | None = None,
+) -> tuple[int, Any]:
+    req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout or _http_timeout()) as resp:
+            body = resp.read()
+            if not body:
+                return int(resp.status), None
+            try:
+                return int(resp.status), json.loads(body.decode("utf-8"))
+            except json.JSONDecodeError:
+                return int(resp.status), None
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        parsed: Any = None
+        try:
+            parsed = json.loads(raw.decode("utf-8")) if raw else None
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            parsed = None
+        return int(e.code), parsed
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return 0, None
+
+
+def refresh_oidc_tokens(entry: dict) -> dict | None:
+    """Exchange refresh_token for new access (+ optional rotated refresh)."""
+    refresh = entry.get("refresh_token")
+    if not refresh:
+        return None
+    client_id = entry.get("oidc_client_id") or "b1a00492-073a-47ea-816f-4c329264a828"
+    issuer = entry.get("oidc_issuer") or "https://auth.x.ai"
+    body = urllib.parse.urlencode(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh,
+            "client_id": client_id,
+        }
+    ).encode("utf-8")
+    status, data = _http_json(
+        "POST",
+        _oidc_token_url(issuer),
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        },
+        data=body,
+    )
+    if status != 200 or not isinstance(data, dict) or not data.get("access_token"):
+        return None
+    return data
+
+
+def apply_token_refresh(auth: dict, token_resp: dict) -> dict:
+    """Return a copy of auth.json with updated access/refresh/expiry."""
+    out = json.loads(json.dumps(auth))
+    key = next(iter(out.keys()), None)
+    if key is None or not isinstance(out[key], dict):
+        return out
+    entry = out[key]
+    entry["key"] = token_resp["access_token"]
+    if token_resp.get("refresh_token"):
+        entry["refresh_token"] = token_resp["refresh_token"]
+    expires_in = token_resp.get("expires_in")
+    if expires_in is not None:
+        try:
+            exp = datetime.now(timezone.utc).timestamp() + float(expires_in)
+            entry["expires_at"] = (
+                datetime.fromtimestamp(exp, tz=timezone.utc)
+                .strftime("%Y-%m-%dT%H:%M:%S.%f")
+                .rstrip("0")
+                .rstrip(".")
+                + "Z"
+            )
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def persist_account_auth(num: int | str, auth: dict, email: str | None = None) -> None:
+    """Write refreshed tokens back to backup; mirror to live if same email."""
+    write_json(account_auth_path(num), auth)
+    live = load_active_auth()
+    live_email = auth_identity(live).get("email")
+    auth_email = email or auth_identity(auth).get("email")
+    if (
+        live
+        and live_email
+        and auth_email
+        and live_email.lower() == auth_email.lower()
+    ):
+        write_json(AUTH_PATH, auth)
+
+
+def load_auth_for_account(num: int | str, seq: dict | None = None) -> dict:
+    """Prefer live auth when it matches the account email (freshest tokens)."""
+    seq = seq or read_sequence()
+    acc = seq["accounts"].get(str(num)) or {}
+    email = (acc.get("email") or "").lower()
+    live = load_active_auth()
+    live_email = (auth_identity(live).get("email") or "").lower()
+    if live and email and live_email == email:
+        return live
+    path = account_auth_path(num)
+    if path.exists():
+        return read_json(path)
+    return {}
+
+
+def ensure_access_token(num: int | str, seq: dict | None = None) -> tuple[str | None, str | None]:
+    """
+    Return (access_token, error_code).
+    error_code: None | 'no_auth' | 'refresh_failed'
+    On successful refresh, tokens are written back to disk.
+    """
+    seq = seq or read_sequence()
+    auth = load_auth_for_account(num, seq)
+    entry = _auth_entry(auth)
+    if not entry:
+        return None, "no_auth"
+
+    token = entry.get("key") or entry.get("access_token")
+    # Refresh early (default 30m) so inactive slots don't sit on nearly-dead access tokens
+    expired = _token_expired(entry, skew_s=_refresh_skew_secs())
+    hard_expired = _token_expired(entry, skew_s=0)
+    if token and not expired:
+        return str(token), None
+
+    # Expired / soon-expired → OIDC refresh (must write back; RTs rotate)
+    token_resp = refresh_oidc_tokens(entry)
+    if not token_resp:
+        if token and not hard_expired:
+            return str(token), None
+        return None, "refresh_failed"
+
+    new_auth = apply_token_refresh(auth, token_resp)
+    email = auth_identity(new_auth).get("email") or (seq["accounts"].get(str(num)) or {}).get(
+        "email"
+    )
+    try:
+        persist_account_auth(num, new_auth, email)
+    except OSError:
+        pass
+    new_entry = _auth_entry(new_auth) or {}
+    return str(new_entry.get("key") or token_resp["access_token"]), None
+
+
+def fetch_billing_payloads(access_token: str) -> tuple[dict | None, dict | None]:
+    """Fetch weekly credits + monthly billing. Returns (credits, monthly)."""
+    base = _billing_base()
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "User-Agent": f"gas/{__version__}",
+    }
+    sc, credits = _http_json("GET", f"{base}/billing?format=credits", headers=headers)
+    sm, monthly = _http_json("GET", f"{base}/billing", headers=headers)
+    credits_ok = sc == 200 and isinstance(credits, dict)
+    monthly_ok = sm == 200 and isinstance(monthly, dict)
+    # 401 on credits: try refresh already done by caller; treat as fail
+    if sc == 401 and sm == 401:
+        return None, None
+    return (credits if credits_ok else None), (monthly if monthly_ok else None)
+
+
+def parse_usage_payloads(
+    credits: dict | None,
+    monthly: dict | None,
+    *,
+    email: str | None = None,
+    account: int | str | None = None,
+) -> dict[str, Any]:
+    """Normalize billing API responses into a stable usage dict."""
+    out: dict[str, Any] = {
+        "email": email,
+        "account": int(account) if account is not None else None,
+        "weekly_percent": None,
+        "weekly_period_type": None,
+        "weekly_start": None,
+        "weekly_end": None,
+        "products": {},
+        "monthly_used": None,
+        "monthly_limit": None,
+        "monthly_start": None,
+        "monthly_end": None,
+        "on_demand_used": None,
+        "on_demand_cap": None,
+        "prepaid_balance": None,
+        "fetched_at": now_ts(),
+        "error": None,
+    }
+
+    if credits and isinstance(credits.get("config"), dict):
+        cfg = credits["config"]
+        if cfg.get("creditUsagePercent") is not None:
+            try:
+                out["weekly_percent"] = float(cfg["creditUsagePercent"])
+            except (TypeError, ValueError):
+                pass
+        period = cfg.get("currentPeriod") or {}
+        if isinstance(period, dict):
+            out["weekly_period_type"] = period.get("type")
+            out["weekly_start"] = period.get("start")
+            out["weekly_end"] = period.get("end")
+        if not out["weekly_end"]:
+            out["weekly_end"] = cfg.get("billingPeriodEnd")
+        if not out["weekly_start"]:
+            out["weekly_start"] = cfg.get("billingPeriodStart")
+        # grok.com shows 0% when utilization is omitted (common for idle / some plans)
+        if out["weekly_percent"] is None and (
+            out["weekly_end"]
+            or out["weekly_start"]
+            or (isinstance(period, dict) and period)
+            or "creditUsagePercent" in cfg
+        ):
+            out["weekly_percent"] = 0.0
+        products: dict[str, float] = {}
+        for item in cfg.get("productUsage") or []:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("product")
+            pct = item.get("usagePercent")
+            if name is not None and pct is not None:
+                try:
+                    products[str(name)] = float(pct)
+                except (TypeError, ValueError):
+                    pass
+        out["products"] = products
+        out["on_demand_used"] = _val_num(cfg.get("onDemandUsed"))
+        out["on_demand_cap"] = _val_num(cfg.get("onDemandCap"))
+        out["prepaid_balance"] = _val_num(cfg.get("prepaidBalance"))
+
+    if monthly and isinstance(monthly.get("config"), dict):
+        mcfg = monthly["config"]
+        out["monthly_used"] = _val_num(mcfg.get("used"))
+        out["monthly_limit"] = _val_num(mcfg.get("monthlyLimit"))
+        out["monthly_start"] = mcfg.get("billingPeriodStart")
+        out["monthly_end"] = mcfg.get("billingPeriodEnd")
+        if out["on_demand_used"] is None:
+            out["on_demand_used"] = _val_num(mcfg.get("onDemandUsed"))
+        if out["on_demand_cap"] is None:
+            out["on_demand_cap"] = _val_num(mcfg.get("onDemandCap"))
+
+    if (
+        out["weekly_percent"] is None
+        and out["monthly_used"] is None
+        and out["monthly_limit"] is None
+    ):
+        out["error"] = "empty"
+    return out
+
+
+def read_usage_cache() -> dict:
+    with _USAGE_CACHE_LOCK:
+        if not USAGE_CACHE_PATH.exists():
+            return {"version": 1, "accounts": {}}
+        data = read_json(USAGE_CACHE_PATH)
+        data.setdefault("version", 1)
+        data.setdefault("accounts", {})
+        if not isinstance(data["accounts"], dict):
+            data["accounts"] = {}
+        return data
+
+
+def write_usage_cache(cache: dict) -> None:
+    with _USAGE_CACHE_LOCK:
+        cache["version"] = 1
+        write_json(USAGE_CACHE_PATH, cache)
+
+
+def update_usage_cache_entry(num: int | str, entry: dict) -> None:
+    """Merge one account entry into the on-disk cache (thread-safe)."""
+    with _USAGE_CACHE_LOCK:
+        if USAGE_CACHE_PATH.exists():
+            try:
+                cache = json.loads(USAGE_CACHE_PATH.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                cache = {"version": 1, "accounts": {}}
+        else:
+            cache = {"version": 1, "accounts": {}}
+        if not isinstance(cache, dict):
+            cache = {"version": 1, "accounts": {}}
+        cache.setdefault("accounts", {})
+        if not isinstance(cache["accounts"], dict):
+            cache["accounts"] = {}
+        cache["accounts"][str(num)] = entry
+        cache["version"] = 1
+        write_json(USAGE_CACHE_PATH, cache)
+
+
+def cache_entry_fresh(entry: dict | None, ttl: float | None = None) -> bool:
+    if not entry or not isinstance(entry, dict):
+        return False
+    if entry.get("error") in ("no_auth", "refresh_failed", "fetch_failed"):
+        # Negative cache briefly so offline/failed accounts don't hammer the API
+        fetched = entry.get("fetched_at")
+        if fetched is None:
+            return False
+        try:
+            return (now_ts() - float(fetched)) < min(ttl or _usage_ttl(), 30.0)
+        except (TypeError, ValueError):
+            return False
+    fetched = entry.get("fetched_at")
+    if fetched is None:
+        return False
+    try:
+        return (now_ts() - float(fetched)) < (ttl or _usage_ttl())
+    except (TypeError, ValueError):
+        return False
+
+
+def fetch_account_usage(
+    num: int | str,
+    seq: dict | None = None,
+    *,
+    force: bool = False,
+    use_cache: bool = True,
+) -> dict[str, Any]:
+    """Fetch (or return cached) usage for one managed account."""
+    seq = seq or read_sequence()
+    acc = seq["accounts"].get(str(num)) or {}
+    email = acc.get("email")
+    cache = read_usage_cache() if use_cache else {"accounts": {}}
+    cached = cache.get("accounts", {}).get(str(num))
+    if use_cache and not force and cache_entry_fresh(cached):
+        return dict(cached)
+
+    if not usage_network_enabled():
+        if cached:
+            return dict(cached)
+        return {
+            "email": email,
+            "account": int(num),
+            "error": "disabled",
+            "fetched_at": now_ts(),
+        }
+
+    token, err = ensure_access_token(num, seq)
+    if not token:
+        result = {
+            "email": email,
+            "account": int(num),
+            "error": err or "no_auth",
+            "fetched_at": now_ts(),
+        }
+        try:
+            update_usage_cache_entry(num, result)
+        except OSError:
+            pass
+        return result
+
+    credits, monthly = fetch_billing_payloads(token)
+    if credits is None and monthly is None:
+        # Access token may be rejected — one refresh retry
+        auth = load_auth_for_account(num, seq)
+        entry = _auth_entry(auth) or {}
+        token_resp = refresh_oidc_tokens(entry)
+        if token_resp:
+            new_auth = apply_token_refresh(auth, token_resp)
+            try:
+                persist_account_auth(num, new_auth, email)
+            except OSError:
+                pass
+            token2 = token_resp["access_token"]
+            credits, monthly = fetch_billing_payloads(token2)
+
+    if credits is None and monthly is None:
+        result = {
+            "email": email,
+            "account": int(num),
+            "error": "fetch_failed",
+            "fetched_at": now_ts(),
+        }
+    else:
+        result = parse_usage_payloads(credits, monthly, email=email, account=num)
+
+    try:
+        update_usage_cache_entry(num, result)
+    except OSError:
+        pass
+    return result
+
+
+def fetch_all_usages(
+    seq: dict | None = None,
+    *,
+    force: bool = False,
+    numbers: list[int] | None = None,
+) -> dict[int, dict[str, Any]]:
+    """Parallel usage fetch for managed accounts."""
+    seq = seq or read_sequence()
+    if numbers is None:
+        numbers = [int(x) for x in (seq.get("sequence") or sorted(int(k) for k in seq["accounts"]))]
+    if not numbers:
+        return {}
+
+    # Serve pure-cache hits without spinning a pool
+    if not force and usage_network_enabled():
+        cache = read_usage_cache()
+        all_fresh = all(
+            cache_entry_fresh(cache.get("accounts", {}).get(str(n))) for n in numbers
+        )
+        if all_fresh:
+            return {
+                n: dict(cache["accounts"][str(n)])
+                for n in numbers
+                if str(n) in cache.get("accounts", {})
+            }
+
+    results: dict[int, dict[str, Any]] = {}
+
+    def _one(n: int) -> tuple[int, dict[str, Any]]:
+        try:
+            return n, fetch_account_usage(n, seq, force=force)
+        except Exception:  # noqa: BLE001
+            return n, {
+                "email": (seq["accounts"].get(str(n)) or {}).get("email"),
+                "account": int(n),
+                "error": "fetch_failed",
+                "fetched_at": now_ts(),
+            }
+
+    workers = min(8, max(1, len(numbers)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = [pool.submit(_one, n) for n in numbers]
+        for fut in as_completed(futs):
+            n, data = fut.result()
+            results[n] = data
+    return results
+
+
+def inspect_account_auth(num: int | str, seq: dict | None = None) -> dict[str, Any]:
+    """
+    Local (no-network) health of an account's credentials.
+
+    status:
+      ok          — access token present and not past expires_at
+      expired     — access past expires_at (refresh may still work)
+      no_refresh  — expired/missing access and no refresh_token
+      missing     — no auth backup / empty
+      unknown     — has token but no expires_at
+    """
+    seq = seq or read_sequence()
+    auth = load_auth_for_account(num, seq)
+    entry = _auth_entry(auth)
+    email = auth_identity(auth).get("email") or (seq["accounts"].get(str(num)) or {}).get(
+        "email"
+    )
+    if not entry:
+        return {
+            "status": "missing",
+            "email": email,
+            "expires_at": None,
+            "has_refresh": False,
+            "needs_relogin": True,
+        }
+    has_token = bool(entry.get("key") or entry.get("access_token"))
+    has_refresh = bool(entry.get("refresh_token"))
+    expires_at = entry.get("expires_at")
+    expired = _token_expired(entry, skew_s=0)
+    if not has_token and not has_refresh:
+        status = "missing"
+        needs = True
+    elif expired and not has_refresh:
+        status = "no_refresh"
+        needs = True
+    elif expired:
+        status = "expired"
+        needs = False  # refresh might work; only network can confirm
+    elif not expires_at:
+        status = "unknown" if has_token else "missing"
+        needs = not has_token
+    else:
+        status = "ok"
+        needs = False
+    return {
+        "status": status,
+        "email": email,
+        "expires_at": expires_at,
+        "has_refresh": has_refresh,
+        "needs_relogin": needs,
+    }
+
+
+def account_needs_relogin(usage: dict | None, auth_health: dict | None = None) -> bool:
+    """True when the user must re-authenticate this account."""
+    if usage and usage.get("error") in ("no_auth", "refresh_failed"):
+        return True
+    if auth_health and auth_health.get("needs_relogin"):
+        return True
+    return False
+
+
+def format_auth_status_compact(health: dict | None) -> str:
+    """Short local-auth badge (used when usage is off or as extra hint)."""
+    if not health:
+        return ""
+    st = health.get("status")
+    if st == "ok":
+        return ""
+    if st in ("missing", "no_refresh"):
+        return f"{RED}re-login{RESET}"
+    if st == "expired":
+        return f"{YELLOW}expired{RESET}"
+    if st == "unknown":
+        return f"{DIM}?{RESET}"
+    return ""
+
+
+def format_usage_compact(u: dict | None) -> str:
+    """Compact ls suffix: '88% used · $128/$150 · reset 7/27'."""
+    if not u:
+        return f"{DIM}?{RESET}"
+    err = u.get("error")
+    if err == "disabled":
+        return ""
+    if err in ("no_auth", "refresh_failed"):
+        return f"{RED}re-login{RESET}"
+    if err == "fetch_failed":
+        return f"{YELLOW}n/a{RESET}"
+    if err == "empty":
+        return f"{DIM}—{RESET}"
+    if err:
+        return f"{DIM}?{RESET}"
+
+    parts: list[str] = []
+    # creditUsagePercent = weekly pool utilization (used, not remaining)
+    wk = u.get("weekly_percent")
+    if wk is not None:
+        try:
+            w = float(wk)
+            parts.append(f"{_pct_color(w)}{int(round(w))}% used{RESET}")
+        except (TypeError, ValueError):
+            pass
+
+    # $ used/limit is the monthly credit budget (no extra label — $ implies it)
+    used = u.get("monthly_used")
+    limit = u.get("monthly_limit")
+    if used is not None and limit is not None:
+        mon = f"${_money(used)}/${_money(limit)}"
+        try:
+            over = float(used) > float(limit) > 0
+        except (TypeError, ValueError):
+            over = False
+        if over:
+            parts.append(f"{RED}{mon}!{RESET}")
+        elif limit and float(limit) > 0:
+            pct = 100.0 * float(used) / float(limit)
+            parts.append(f"{_pct_color(pct)}{mon}{RESET}")
+        else:
+            parts.append(mon)
+    elif used is not None:
+        parts.append(f"${_money(used)}")
+
+    reset_ts = u.get("weekly_end") or u.get("monthly_end")
+    countdown = format_reset_countdown(reset_ts)
+    if countdown:
+        parts.append(f"{DIM}{countdown}{RESET}")
+
+    return f" {DIM}·{RESET} ".join(parts) if parts else f"{DIM}—{RESET}"
+
+
+def format_ls_row_suffix(
+    usage: dict | None,
+    auth_health: dict | None,
+    *,
+    show_usage: bool,
+) -> str:
+    """Combined usage + auth badge for one ls line."""
+    if show_usage and usage is not None:
+        compact = format_usage_compact(usage)
+        if compact:
+            return f"  {compact}"
+        return ""
+    # Offline / --no-usage: still surface local auth problems
+    badge = format_auth_status_compact(auth_health)
+    if badge:
+        return f"  {badge}"
+    return ""
+
+
+def format_relogin_footer(need_nums: list[int], seq: dict) -> list[str]:
+    """One-line summary for accounts that require re-login."""
+    if not need_nums:
+        return []
+    ids = ", ".join(str(n) for n in need_nums)
+    first = need_nums[0]
+    return [
+        f"{YELLOW}⚠{RESET} re-login {BOLD}{ids}{RESET}  "
+        f"{DIM}→{RESET}  {CYAN}gas to {first}{RESET} && "
+        f"{CYAN}grok login{RESET} && {CYAN}gas add{RESET}"
+    ]
+
+
+def format_reset_short(iso_ts: str | None) -> str | None:
+    """Local M/D HH:MM (e.g. 7/30 11:56) — used in detail absolute lines."""
+    if not iso_ts:
+        return None
+    exp = _parse_expires_at(iso_ts)
+    if not exp:
+        return None
+    try:
+        exp = exp.astimezone()
+    except (ValueError, OSError, OverflowError):
+        pass
+    return f"{exp.month}/{exp.day} {exp.hour:02d}:{exp.minute:02d}"
+
+
+def format_reset_countdown(iso_ts: str | None) -> str | None:
+    """Human countdown for ls, e.g. 'Resets in 5d 21h 18m'."""
+    if not iso_ts:
+        return None
+    exp = _parse_expires_at(iso_ts)
+    if not exp:
+        return None
+    now = datetime.now(timezone.utc)
+    diff = int((exp - now).total_seconds())
+    if diff <= 0:
+        return "Reset due"
+    days = diff // 86400
+    hours = (diff % 86400) // 3600
+    mins = (diff % 3600) // 60
+    bits: list[str] = []
+    if days > 0:
+        bits.append(f"{days}d")
+    if days > 0 or hours > 0:
+        bits.append(f"{hours}h")
+    bits.append(f"{mins}m")
+    return "Resets in " + " ".join(bits)
+
+
+def format_reset_absolute(iso_ts: str | None, *, local: bool = True) -> str | None:
+    """Human date/time for a reset instant (local wall clock by default)."""
+    if not iso_ts:
+        return None
+    exp = _parse_expires_at(iso_ts)
+    if not exp:
+        return str(iso_ts)[:16] if iso_ts else None
+    if local:
+        try:
+            exp = exp.astimezone()
+        except (ValueError, OSError, OverflowError):
+            pass
+        # e.g. Jul 27 15:45
+        return exp.strftime("%b %d %H:%M")
+    return exp.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def format_reset_relative(iso_ts: str | None) -> str | None:
+    """Relative time until reset, e.g. 'in 2d' / 'due'."""
+    if not iso_ts:
+        return None
+    exp = _parse_expires_at(iso_ts)
+    if not exp:
+        return None
+    now = datetime.now(timezone.utc)
+    diff = int((exp - now).total_seconds())
+    if diff <= 0:
+        return "due"
+    if diff < 3600:
+        return f"in {max(1, diff // 60)}m"
+    if diff < 86400:
+        return f"in {diff // 3600}h"
+    days = diff // 86400
+    hours = (diff % 86400) // 3600
+    if hours and days < 3:
+        return f"in {days}d {hours}h"
+    return f"in {days}d"
+
+
+def format_reset_hint(iso_ts: str | None) -> str | None:
+    """Combined absolute + relative, e.g. 'Jul 27 15:45 (in 2d)'."""
+    abs_s = format_reset_absolute(iso_ts)
+    rel = format_reset_relative(iso_ts)
+    if abs_s and rel:
+        return f"{abs_s} ({rel})"
+    return abs_s or rel
+
+
+def format_usage_detail(u: dict | None, *, indent: str = "  ") -> list[str]:
+    """Multi-line detail for status / usage commands."""
+    lines: list[str] = []
+    if not u:
+        lines.append(f"{indent}Usage:           {DIM}unavailable{RESET}")
+        return lines
+    err = u.get("error")
+    if err and err not in (None, "empty"):
+        hints = {
+            "no_auth": f"{RED}needs re-login{RESET} — no credentials on disk",
+            "refresh_failed": (
+                f"{RED}needs re-login{RESET} — token expired/revoked; "
+                f"run {CYAN}gas to <id>{RESET} && {CYAN}grok login{RESET} && {CYAN}gas add{RESET}"
+            ),
+            "fetch_failed": f"{YELLOW}usage unavailable{RESET} — could not reach billing API",
+            "disabled": f"{DIM}disabled (GAS_USAGE=0){RESET}",
+        }
+        lines.append(f"{indent}Auth/Usage:      {hints.get(err, err)}")
+        return lines
+
+    wk = u.get("weekly_percent")
+    if wk is not None:
+        w = float(wk)
+        reset = format_reset_hint(u.get("weekly_end"))
+        extra = f"  {DIM}reset {reset}{RESET}" if reset else ""
+        lines.append(
+            f"{indent}Weekly usage:    {_pct_color(w)}{int(round(w))}%{RESET}{extra}"
+        )
+    else:
+        lines.append(f"{indent}Weekly usage:    {DIM}—{RESET}")
+        # Still show weekly window end if API returned period without percent
+        reset = format_reset_hint(u.get("weekly_end"))
+        if reset:
+            lines.append(f"{indent}Weekly reset:    {DIM}{reset}{RESET}")
+
+    products = u.get("products") or {}
+    if products:
+        order = ["GrokBuild", "GrokChat", "Api"]
+        keys = [k for k in order if k in products] + [
+            k for k in sorted(products) if k not in order
+        ]
+        bits = []
+        for k in keys:
+            try:
+                bits.append(f"{k} {int(round(float(products[k])))}%")
+            except (TypeError, ValueError):
+                bits.append(f"{k} ?")
+        lines.append(f"{indent}By product:      {DIM}{', '.join(bits)}{RESET}")
+
+    used = u.get("monthly_used")
+    limit = u.get("monthly_limit")
+    mon_reset = format_reset_hint(u.get("monthly_end"))
+    if used is not None and limit is not None:
+        mon = f"${_money(used)} / ${_money(limit)}"
+        try:
+            pct = 100.0 * float(used) / float(limit) if float(limit) else 0.0
+            over = float(used) > float(limit) > 0
+        except (TypeError, ValueError):
+            pct, over = 0.0, False
+        tag = f" {RED}OVER{RESET}" if over else f"  {DIM}({int(round(pct))}%){RESET}"
+        lines.append(
+            f"{indent}Monthly limit:   {_pct_color(pct) if not over else RED}{mon}{RESET}{tag}"
+        )
+    elif used is not None:
+        lines.append(f"{indent}Monthly used:    ${_money(used)}")
+    else:
+        lines.append(f"{indent}Monthly limit:   {DIM}—{RESET}")
+    if mon_reset:
+        lines.append(f"{indent}Monthly reset:   {DIM}{mon_reset}{RESET}")
+
+    od_used = u.get("on_demand_used")
+    od_cap = u.get("on_demand_cap")
+    if od_cap is not None and float(od_cap) > 0:
+        lines.append(
+            f"{indent}On-demand:       ${_money(od_used or 0)} / ${_money(od_cap)}"
+        )
+    prepaid = u.get("prepaid_balance")
+    if prepaid is not None and float(prepaid) > 0:
+        lines.append(f"{indent}Prepaid:         ${_money(prepaid)}")
+
+    return lines
+
+
 # ── commands ────────────────────────────────────────────────────────────────
 
 
@@ -637,7 +1631,7 @@ def cmd_add(_: argparse.Namespace) -> None:
     info(f"       switch with {CYAN}gas sw{RESET} or {CYAN}gas to {num}{RESET}")
 
 
-def cmd_ls(_: argparse.Namespace) -> None:
+def cmd_ls(args: argparse.Namespace) -> None:
     ensure_layout()
     seq = read_sequence()
     live_email = get_current_email()
@@ -661,8 +1655,26 @@ def cmd_ls(_: argparse.Namespace) -> None:
     if active_num is None:
         active_num = seq.get("activeAccountNumber")
 
+    no_usage = bool(getattr(args, "no_usage", False))
+    force = bool(getattr(args, "refresh", False))
+    show_usage = (not no_usage) and usage_network_enabled()
+    numbers = [
+        int(n)
+        for n in (seq.get("sequence") or sorted(int(k) for k in seq["accounts"]))
+        if str(n) in seq["accounts"]
+    ]
+    usages: dict[int, dict[str, Any]] = {}
+    if show_usage:
+        usages = fetch_all_usages(seq, force=force, numbers=numbers)
+
+    # Local auth health always (cheap); pairs with usage for re-login detection
+    auth_health: dict[int, dict[str, Any]] = {
+        n: inspect_account_auth(n, seq) for n in numbers
+    }
+
     info(f"{BOLD}Accounts{RESET}  {DIM}({SWITCH_DIR}){RESET}")
-    for num in seq.get("sequence") or sorted(int(k) for k in seq["accounts"]):
+    need_relogin: list[int] = []
+    for num in numbers:
         acc = seq["accounts"].get(str(num))
         if not acc:
             continue
@@ -674,13 +1686,25 @@ def cmd_ls(_: argparse.Namespace) -> None:
             if active_num is not None and int(num) == int(active_num)
             else ""
         )
-        info(f"  {num}: {email}{prof_s}{mark}")
+        health = auth_health.get(int(num))
+        usage = usages.get(int(num)) if show_usage else None
+        suffix = format_ls_row_suffix(usage, health, show_usage=show_usage)
+        info(f"  {num}: {email}{prof_s}{mark}{suffix}")
+        if account_needs_relogin(usage, health):
+            need_relogin.append(int(num))
+        elif show_usage and usage and usage.get("error") == "fetch_failed":
+            # Network fail is not re-login, but if local says expired without RT, still flag
+            if health and health.get("status") in ("missing", "no_refresh"):
+                need_relogin.append(int(num))
 
     if live_email and account_exists_email(live_email, seq) is None:
         info(
             f"\n  {YELLOW}notice:{RESET} live login {live_email} is not managed — "
             f"run {CYAN}gas add{RESET}"
         )
+
+    for line in format_relogin_footer(need_relogin, seq):
+        info(line)
 
 
 def cmd_sw(_: argparse.Namespace) -> None:
@@ -776,7 +1800,7 @@ def cmd_rm(args: argparse.Namespace) -> None:
     info(f"  {DIM}live {AUTH_PATH} was not deleted{RESET}")
 
 
-def cmd_status(_: argparse.Namespace) -> None:
+def cmd_status(args: argparse.Namespace) -> None:
     ensure_layout()
     seq = read_sequence()
     live = auth_identity(load_active_auth())
@@ -812,6 +1836,14 @@ def cmd_status(_: argparse.Namespace) -> None:
         info("Token status:    no expires_at in auth.json")
     else:
         info("Token status:    no credentials")
+
+    # SuperGrok credit usage for the active managed account
+    if active_num is not None and str(active_num) in seq["accounts"] and usage_network_enabled():
+        force = bool(getattr(args, "refresh", False))
+        usage = fetch_account_usage(active_num, seq, force=force)
+        info()
+        for line in format_usage_detail(usage, indent=""):
+            info(line)
 
 
 def _format_expiry(expires_at: str) -> str:
@@ -867,6 +1899,143 @@ def cmd_stats(_: argparse.Namespace) -> None:
         if last != "never" and len(str(last)) > 16:
             last = str(last)[:16]
         info(f"{num:<6} {email:<28} {switches:<9} {time_str:<14} {last}")
+
+
+def cmd_usage(args: argparse.Namespace) -> None:
+    """Show SuperGrok credit usage (network). Alias: cost."""
+    ensure_layout()
+    seq = read_sequence()
+    if not seq["accounts"]:
+        info("No accounts are managed yet.")
+        return
+
+    force = bool(getattr(args, "refresh", False))
+    as_json = bool(getattr(args, "as_json", False))
+    identifier = getattr(args, "identifier", None)
+
+    if identifier:
+        num = resolve_account_identifier(identifier, seq)
+        if num is None:
+            die(f"no account found matching: {identifier}")
+        numbers = [int(num)]
+    else:
+        numbers = [
+            int(n)
+            for n in (seq.get("sequence") or sorted(int(k) for k in seq["accounts"]))
+            if str(n) in seq["accounts"]
+        ]
+
+    if not usage_network_enabled() and not as_json:
+        info(f"{DIM}usage network disabled (GAS_USAGE=0); showing cache if any{RESET}")
+
+    usages = fetch_all_usages(seq, force=force, numbers=numbers)
+
+    if as_json:
+        payload = {str(n): usages.get(n) for n in numbers}
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+
+    info(f"{BOLD}Credit Usage{RESET}")
+    info("============")
+    live_email = get_current_email()
+    active_num = account_exists_email(live_email, seq) if live_email else None
+    if active_num is None:
+        active_num = seq.get("activeAccountNumber")
+
+    need_relogin: list[int] = []
+    for num in numbers:
+        acc = seq["accounts"].get(str(num)) or {}
+        email = acc.get("email") or "?"
+        prof = acc.get("profile")
+        prof_s = f" [{prof}]" if prof else ""
+        mark = (
+            f" {GREEN}(active){RESET}"
+            if active_num is not None and int(num) == int(active_num)
+            else ""
+        )
+        usage = usages.get(num)
+        health = inspect_account_auth(num, seq)
+        info()
+        info(f"{BOLD}Account-{num}{RESET}: {email}{prof_s}{mark}")
+        # Local auth line first when something is wrong
+        if health.get("status") not in ("ok", "unknown") or account_needs_relogin(
+            usage, health
+        ):
+            st = health.get("status")
+            exp = health.get("expires_at")
+            exp_s = f"  expires_at={exp}" if exp else ""
+            if account_needs_relogin(usage, health) or st in (
+                "missing",
+                "no_refresh",
+                "expired",
+            ):
+                if account_needs_relogin(usage, health):
+                    info(
+                        f"  Auth:            {RED}needs re-login{RESET} "
+                        f"{DIM}(local={st}{exp_s}){RESET}"
+                    )
+                else:
+                    info(f"  Auth:            {YELLOW}{st}{RESET}{DIM}{exp_s}{RESET}")
+        for line in format_usage_detail(usage, indent="  "):
+            info(line)
+        if account_needs_relogin(usage, health):
+            need_relogin.append(int(num))
+
+    for line in format_relogin_footer(need_relogin, seq):
+        info(line)
+
+    info()
+    info(f"{DIM}Source: cli-chat-proxy billing · cache TTL {_usage_ttl():.0f}s · gas usage --refresh{RESET}")
+
+
+def cmd_refresh(args: argparse.Namespace) -> None:
+    """Proactively refresh OIDC tokens for managed accounts (write-back)."""
+    ensure_layout()
+    seq = read_sequence()
+    if not seq["accounts"]:
+        info("No accounts are managed yet.")
+        return
+
+    force = bool(getattr(args, "force", False))
+    identifier = getattr(args, "identifier", None)
+    if identifier:
+        num = resolve_account_identifier(identifier, seq)
+        if num is None:
+            die(f"no account found matching: {identifier}")
+        numbers = [int(num)]
+    else:
+        numbers = [
+            int(n)
+            for n in (seq.get("sequence") or sorted(int(k) for k in seq["accounts"]))
+            if str(n) in seq["accounts"]
+        ]
+
+    # Live mirror first (active slot gets Grok's latest tokens for free)
+    synced = sync_live_to_managed(seq)
+    if synced is not None and not SILENT:
+        info(f"{DIM}synced live → Account-{synced}{RESET}")
+
+    need: list[int] = []
+    info(f"{BOLD}Token refresh{RESET}")
+    for num in numbers:
+        acc = seq["accounts"].get(str(num)) or {}
+        email = acc.get("email") or "?"
+        status, detail = refresh_account_tokens(num, seq, force=force)
+        if status == "ok":
+            info(f"  {num}: {email}  {GREEN}ok{RESET}  {DIM}{detail or ''}{RESET}")
+        elif status == "refreshed":
+            info(f"  {num}: {email}  {GREEN}refreshed{RESET}  {DIM}exp {detail or '?'}{RESET}")
+        elif status == "missing":
+            info(f"  {num}: {email}  {RED}missing{RESET}  {DIM}{detail or ''}{RESET}")
+            need.append(num)
+        else:
+            info(f"  {num}: {email}  {RED}re-login{RESET}  {DIM}{detail or ''}{RESET}")
+            need.append(num)
+
+    for line in format_relogin_footer(need, seq):
+        info(line)
+    if need:
+        raise SystemExit(1)
 
 
 def cmd_check(_: argparse.Namespace) -> None:
@@ -1137,7 +2306,7 @@ examples:
   gas dir ~/proj 1 && gas auto
   gas exec 2 -- grok -p "hi"      # isolated via GROK_HOME
   gas config-dir 2                # print export GROK_HOME=...
-  gas check / status / stats
+  gas check / status / stats / usage / refresh
 
   # second account:
   gas add && grok logout && grok login && gas add && gas sw
@@ -1146,6 +2315,9 @@ environment:
   GSS_HOME / GAS_HOME   store dir (default ~/.grok-switch)
   GROK_HOME / GROK_DIR  live Grok config (default ~/.grok)
   GAS_SILENT=1          quiet mode (for scripts)
+  GAS_USAGE=0           disable SuperGrok usage network fetch
+  GAS_USAGE_TTL         usage cache seconds (default 120)
+  GAS_REFRESH_SKEW_SECS refresh this many seconds before access expiry (default 1800)
   NO_COLOR              disable colors
 """,
     )
@@ -1160,7 +2332,19 @@ environment:
     sub = p.add_subparsers(dest="cmd")
 
     sub.add_parser("add", help="add/update current login as managed account")
-    sub.add_parser("ls", aliases=["list"], help="list managed accounts")
+
+    sp = sub.add_parser("ls", aliases=["list"], help="list managed accounts (+ SuperGrok usage)")
+    sp.add_argument(
+        "--no-usage",
+        action="store_true",
+        help="skip network credit-usage fetch",
+    )
+    sp.add_argument(
+        "--refresh",
+        action="store_true",
+        help="force refresh usage cache",
+    )
+
     sub.add_parser("sw", help="rotate to next account in sequence")
     sp = sub.add_parser("to", help="switch to account by number, email, or profile")
     sp.add_argument("identifier")
@@ -1192,8 +2376,37 @@ environment:
     sp.add_argument("dest", nargs="?", help="optional destination path")
 
     sub.add_parser("check", help="verify backup integrity")
-    sub.add_parser("status", aliases=["current"], help="current account + token expiry")
-    sub.add_parser("stats", help="per-account usage statistics")
+
+    sp = sub.add_parser(
+        "status",
+        aliases=["current"],
+        help="current account + token expiry + usage",
+    )
+    sp.add_argument("--refresh", action="store_true", help="force refresh usage cache")
+
+    sub.add_parser("stats", help="per-account switch statistics (local)")
+
+    sp = sub.add_parser(
+        "refresh",
+        help="refresh OIDC tokens for managed accounts (write-back)",
+    )
+    sp.add_argument("identifier", nargs="?", help="optional account filter")
+    sp.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="refresh even if access token still valid",
+    )
+
+    sp = sub.add_parser(
+        "usage",
+        aliases=["cost"],
+        help="SuperGrok credit usage (weekly + monthly)",
+    )
+    sp.add_argument("identifier", nargs="?", help="optional account number/email/profile")
+    sp.add_argument("--refresh", action="store_true", help="force refresh usage cache")
+    sp.add_argument("--json", dest="as_json", action="store_true", help="machine-readable JSON")
+
     sub.add_parser("whoami", help="print active email")
     sub.add_parser("version", help="print version")
     sub.add_parser("help", help="show help")
@@ -1217,7 +2430,7 @@ def main(argv: list | None = None) -> None:
 
     cmd = args.cmd
     if cmd is None:
-        cmd_ls(argparse.Namespace())
+        cmd_ls(argparse.Namespace(no_usage=False, refresh=False))
         return
     if cmd == "help":
         cmd_help(parser)
@@ -1241,6 +2454,9 @@ def main(argv: list | None = None) -> None:
         "status": cmd_status,
         "current": cmd_status,
         "stats": cmd_stats,
+        "refresh": cmd_refresh,
+        "usage": cmd_usage,
+        "cost": cmd_usage,
         "whoami": cmd_whoami,
         "version": cmd_version,
         "save": cmd_save_legacy,

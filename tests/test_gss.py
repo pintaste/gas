@@ -49,6 +49,8 @@ class GasTest(unittest.TestCase):
         self.env["GROK_DIR"] = str(self.grok)
         self.env["GSS_HOME"] = str(self.switch)
         self.env["NO_COLOR"] = "1"
+        # Keep unit tests offline by default; usage tests re-enable + mock HTTP.
+        self.env["GAS_USAGE"] = "0"
         self.env.pop("GAS_SILENT", None)
         self.env.pop("CCS_SILENT", None)
         self.env["PATH"] = str(ROOT) + os.pathsep + self.env.get("PATH", "")
@@ -289,6 +291,329 @@ class GasTest(unittest.TestCase):
         self.run_gas("to", "1")
         r = self.run_gas("stats")
         self.assertIn("Switches", r.stdout)
+
+    def test_ls_no_usage_flag(self):
+        self.write_active(sample_auth())
+        self.run_gas("add")
+        r = self.run_gas("ls", "--no-usage")
+        self.assertIn("alice@example.com", r.stdout)
+        self.assertIn("(active)", r.stdout)
+        # Fresh sample token: no re-login banner
+        self.assertNotIn("need re-login", r.stdout)
+
+    def test_usage_disabled_shows_hint(self):
+        self.write_active(sample_auth())
+        self.run_gas("add")
+        r = self.run_gas("usage")
+        self.assertIn("Credit Usage", r.stdout)
+        self.assertIn("disabled", r.stdout.lower())
+
+    def test_ls_flags_expired_auth_offline(self):
+        """Local-only: expired access without refresh_token → needs re-login."""
+        auth = sample_auth("dead@x.com")
+        entry = next(iter(auth.values()))
+        entry["expires_at"] = "2020-01-01T00:00:00Z"
+        entry.pop("refresh_token", None)
+        self.write_active(auth)
+        self.run_gas("add")
+        r = self.run_gas("ls", "--no-usage")
+        self.assertIn("re-login", r.stdout)
+        self.assertIn("grok login", r.stdout)
+
+    def test_sync_live_to_managed_on_command(self):
+        """Any gas command should mirror refreshed live tokens into the active slot."""
+        self.write_active(sample_auth("a@x.com"))
+        self.run_gas("add")
+        # Simulate Grok refreshing live tokens
+        live = sample_auth("a@x.com")
+        next(iter(live.values()))["key"] = "brand-new-access"
+        next(iter(live.values()))["refresh_token"] = "brand-new-refresh"
+        self.write_active(live)
+        self.run_gas("whoami")
+        stored = json.loads((self.switch / "accounts" / "1" / "auth.json").read_text())
+        entry = next(iter(stored.values()))
+        self.assertEqual(entry["key"], "brand-new-access")
+        self.assertEqual(entry["refresh_token"], "brand-new-refresh")
+
+
+class UsageUnitTest(unittest.TestCase):
+    """Pure unit tests for usage parsers / formatters (no subprocess)."""
+
+    def setUp(self) -> None:
+        # Import extensionless `gas` script as a module for helper tests.
+        import importlib.util
+        from importlib.machinery import SourceFileLoader
+
+        loader = SourceFileLoader("gas_mod", str(GAS))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        assert spec and spec.loader
+        self.gas = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.gas)
+
+    def test_parse_usage_payloads_weekly_and_monthly(self):
+        credits = {
+            "config": {
+                "currentPeriod": {
+                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                    "start": "2026-07-20T00:00:00+00:00",
+                    "end": "2026-07-27T00:00:00+00:00",
+                },
+                "creditUsagePercent": 85.0,
+                "productUsage": [
+                    {"product": "GrokBuild", "usagePercent": 78.0},
+                    {"product": "GrokChat", "usagePercent": 4.0},
+                ],
+                "onDemandCap": {"val": 0},
+                "onDemandUsed": {"val": 0},
+                "prepaidBalance": {"val": 0},
+            }
+        }
+        monthly = {
+            "config": {
+                "monthlyLimit": {"val": 15000},
+                "used": {"val": 12650},
+                "billingPeriodStart": "2026-07-01T00:00:00+00:00",
+                "billingPeriodEnd": "2026-08-01T00:00:00+00:00",
+            }
+        }
+        u = self.gas.parse_usage_payloads(credits, monthly, email="a@x.com", account=1)
+        self.assertEqual(u["weekly_percent"], 85.0)
+        self.assertEqual(u["monthly_used"], 12650.0)
+        self.assertEqual(u["monthly_limit"], 15000.0)
+        self.assertEqual(u["products"]["GrokBuild"], 78.0)
+        self.assertIsNone(u["error"])
+
+        compact = self.gas.format_usage_compact(u)
+        self.assertIn("85% used", compact)
+        self.assertIn("$126.50/$150", compact)
+        self.assertNotIn("monthly", compact)
+        self.assertRegex(compact, r"Resets in \d+d \d+h \d+m|Resets in \d+h \d+m|Resets in \d+m|Reset due")
+
+    def test_parse_usage_monthly_only_over(self):
+        monthly = {
+            "config": {
+                "monthlyLimit": {"val": 4000},
+                "used": {"val": 6048},
+            }
+        }
+        u = self.gas.parse_usage_payloads(None, monthly, email="b@x.com", account=2)
+        self.assertIsNone(u["weekly_percent"])
+        compact = self.gas.format_usage_compact(u)
+        self.assertIn("$60.48/$40!", compact)
+
+    def test_parse_usage_omitted_weekly_percent_is_zero(self):
+        """Web UI shows 0% when creditUsagePercent is missing but weekly period exists."""
+        credits = {
+            "config": {
+                "currentPeriod": {
+                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                    "start": "2026-07-23T18:56:17.204886+00:00",
+                    "end": "2026-07-30T18:56:17.204886+00:00",
+                },
+                "onDemandCap": {"val": 0},
+                "onDemandUsed": {"val": 0},
+                "isUnifiedBillingUser": True,
+                "prepaidBalance": {"val": 0},
+                "billingPeriodStart": "2026-07-23T18:56:17.204886+00:00",
+                "billingPeriodEnd": "2026-07-30T18:56:17.204886+00:00",
+            }
+        }
+        monthly = {
+            "config": {
+                "monthlyLimit": {"val": 15000},
+                "used": {"val": 4615},
+            }
+        }
+        u = self.gas.parse_usage_payloads(credits, monthly, email="c@x.com", account=3)
+        self.assertEqual(u["weekly_percent"], 0.0)
+        compact = self.gas.format_usage_compact(u)
+        self.assertIn("0% used", compact)
+        self.assertIn("$46.15/$150", compact)
+        self.assertRegex(compact, r"Resets in |Reset due")
+
+    def test_money_and_val(self):
+        self.assertEqual(self.gas._money(15000), "150")
+        self.assertEqual(self.gas._money(12650), "126.50")
+        self.assertEqual(self.gas._val_num({"val": 12}), 12.0)
+        self.assertEqual(self.gas._val_num(3), 3.0)
+        self.assertIsNone(self.gas._val_num(None))
+
+    def test_format_reset_absolute_and_hint(self):
+        ts = "2026-07-27T19:45:12.968910+00:00"
+        abs_s = self.gas.format_reset_absolute(ts, local=False)
+        self.assertEqual(abs_s, "2026-07-27 19:45 UTC")
+        hint = self.gas.format_reset_hint(ts)
+        self.assertIsNotNone(hint)
+        assert hint is not None
+        self.assertIn("(", hint)  # absolute + relative
+        detail = "\n".join(
+            self.gas.format_usage_detail(
+                {
+                    "weekly_percent": 50.0,
+                    "weekly_end": ts,
+                    "monthly_used": 1000.0,
+                    "monthly_limit": 15000.0,
+                    "monthly_end": "2026-08-01T00:00:00+00:00",
+                    "products": {},
+                },
+                indent="",
+            )
+        )
+        self.assertIn("Weekly usage:", detail)
+        self.assertIn("reset ", detail)
+        self.assertIn("Monthly reset:", detail)
+
+    def test_format_reset_countdown(self):
+        from datetime import datetime, timedelta, timezone
+
+        future = datetime.now(timezone.utc) + timedelta(days=5, hours=21, minutes=18)
+        s = self.gas.format_reset_countdown(future.isoformat())
+        self.assertIsNotNone(s)
+        assert s is not None
+        self.assertTrue(s.startswith("Resets in "))
+        self.assertIn("d", s)
+        self.assertIn("h", s)
+        self.assertIn("m", s)
+        past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        self.assertEqual(self.gas.format_reset_countdown(past), "Reset due")
+
+    def test_apply_token_refresh(self):
+        auth = sample_auth("a@x.com")
+        refreshed = self.gas.apply_token_refresh(
+            auth,
+            {
+                "access_token": "new-at",
+                "refresh_token": "new-rt",
+                "expires_in": 3600,
+            },
+        )
+        entry = next(iter(refreshed.values()))
+        self.assertEqual(entry["key"], "new-at")
+        self.assertEqual(entry["refresh_token"], "new-rt")
+        self.assertIn("expires_at", entry)
+
+    def test_format_usage_detail_error(self):
+        lines = self.gas.format_usage_detail({"error": "refresh_failed"}, indent="  ")
+        self.assertTrue(any("needs re-login" in ln for ln in lines))
+        self.assertTrue(any("grok login" in ln for ln in lines))
+
+    def test_format_usage_compact_relogin(self):
+        self.assertIn(
+            "re-login",
+            self.gas.format_usage_compact({"error": "refresh_failed"}),
+        )
+        self.assertIn(
+            "n/a",
+            self.gas.format_usage_compact({"error": "fetch_failed"}),
+        )
+
+    def test_inspect_account_auth_and_footer(self):
+        health_ok = {
+            "status": "ok",
+            "needs_relogin": False,
+            "has_refresh": True,
+            "expires_at": "2099-01-01T00:00:00Z",
+            "email": "a@x.com",
+        }
+        self.assertFalse(self.gas.account_needs_relogin(None, health_ok))
+        self.assertTrue(
+            self.gas.account_needs_relogin({"error": "refresh_failed"}, health_ok)
+        )
+        seq = {
+            "accounts": {
+                "2": {"email": "b@x.com", "profile": "work"},
+                "3": {"email": "c@x.com"},
+            }
+        }
+        footer = "\n".join(self.gas.format_relogin_footer([2, 3], seq))
+        self.assertIn("re-login 2, 3", footer)
+        self.assertIn("gas to 2", footer)
+        self.assertEqual(len(self.gas.format_relogin_footer([2, 3], seq)), 1)
+
+    def test_fetch_account_usage_with_mock_http(self):
+        """Mock _http_json so we never hit the network."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        grok = base / "grok"
+        switch = base / "switch"
+        grok.mkdir()
+        switch.mkdir()
+
+        # Point module paths at temp dirs
+        self.gas.GROK_DIR = grok
+        self.gas.AUTH_PATH = grok / "auth.json"
+        self.gas.SWITCH_DIR = switch
+        self.gas.ACCOUNTS_DIR = switch / "accounts"
+        self.gas.SEQUENCE_PATH = switch / "sequence.json"
+        self.gas.USAGE_CACHE_PATH = switch / "usage-cache.json"
+        self.gas.ACCOUNTS_DIR.mkdir(parents=True)
+
+        auth = sample_auth("a@x.com")
+        # Not expired
+        next(iter(auth.values()))["expires_at"] = "2099-01-01T00:00:00Z"
+        self.gas.write_json(self.gas.AUTH_PATH, auth)
+        self.gas.write_json(self.gas.account_auth_path(1), auth)
+        self.gas.write_json(
+            self.gas.SEQUENCE_PATH,
+            {
+                "version": 2,
+                "activeAccountNumber": 1,
+                "sequence": [1],
+                "accounts": {
+                    "1": {
+                        "email": "a@x.com",
+                        "profile": "main",
+                        "switchCount": 0,
+                        "totalSeconds": 0,
+                    }
+                },
+            },
+        )
+
+        def fake_http(method, url, headers=None, data=None, timeout=None):
+            if "format=credits" in url:
+                return 200, {
+                    "config": {
+                        "creditUsagePercent": 42.0,
+                        "currentPeriod": {
+                            "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                            "end": "2099-01-08T00:00:00+00:00",
+                        },
+                        "productUsage": [{"product": "GrokBuild", "usagePercent": 40.0}],
+                    }
+                }
+            if url.rstrip("/").endswith("/billing") or url.endswith("/billing"):
+                return 200, {
+                    "config": {
+                        "monthlyLimit": {"val": 10000},
+                        "used": {"val": 2500},
+                    }
+                }
+            return 404, None
+
+        orig = self.gas._http_json
+        self.gas._http_json = fake_http
+        # Force network path even if env says off
+        old = os.environ.get("GAS_USAGE")
+        os.environ["GAS_USAGE"] = "1"
+        try:
+            u = self.gas.fetch_account_usage(1, force=True)
+            self.assertEqual(u["weekly_percent"], 42.0)
+            self.assertEqual(u["monthly_used"], 2500.0)
+            self.assertEqual(u["monthly_limit"], 10000.0)
+            self.assertIsNone(u.get("error"))
+            # Cache written
+            self.assertTrue(self.gas.USAGE_CACHE_PATH.exists())
+            # Second call hits cache (still valid)
+            u2 = self.gas.fetch_account_usage(1, force=False)
+            self.assertEqual(u2["weekly_percent"], 42.0)
+        finally:
+            self.gas._http_json = orig
+            if old is None:
+                os.environ.pop("GAS_USAGE", None)
+            else:
+                os.environ["GAS_USAGE"] = old
 
 
 if __name__ == "__main__":
